@@ -644,7 +644,7 @@ function productHtml(item, mode) {
   }
 
   if (mode === "slip") {
-    const price = (toCents(item.price) / 100).toFixed(2);
+    const price = formatMoney(toCents(item.price));
     if (product) {
       return `<div class="slip-hero">
         ${productImage(product.img ? largeImage(product.img) : "", 56, "contain")}
@@ -798,10 +798,10 @@ function receiptsView() {
   let html = `<div class="add-row">
     <label class="dropzone" id="dropzone">
       <input type="file" id="file" accept="image/*" multiple>
-      ${icon("camera", 20)}
+      ${icon("camera", 18)}
       <b>Add receipt photos</b>
     </label>
-    <button class="key-button${canReadPhotos() ? "" : " needs-key"}${keyOpen ? " on" : ""}" id="toggle-key" aria-label="${keyLabel}" title="${keyLabel}" aria-expanded="${keyOpen || !canReadPhotos()}">${icon("sparkle", 20)}</button>
+    <button class="key-button${canReadPhotos() ? "" : " needs-key"}${keyOpen ? " on" : ""}" id="toggle-key" aria-label="${keyLabel}" title="${keyLabel}" aria-expanded="${keyOpen || !canReadPhotos()}">${icon("sparkle", 14)}<span>Gemini</span></button>
   </div>`;
 
   html += keyPanelHtml();

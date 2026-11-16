@@ -442,8 +442,12 @@ input[type="number"]::-webkit-outer-spin-button {
 
 .add-row {
   display: flex;
-  gap: 8px;
+  min-height: 52px;
   margin-bottom: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
 }
 
 .dropzone {
@@ -452,41 +456,41 @@ input[type="number"]::-webkit-outer-spin-button {
   align-items: center;
   justify-content: center;
   gap: 8px;
-  min-height: 56px;
-  border: 1px dashed var(--border-strong);
-  border-radius: 12px;
-  padding: 8px 16px;
-  text-align: center;
+  padding: 0 16px;
   cursor: pointer;
-  background: var(--surface);
-  color: var(--text-muted);
-  font-size: 13px;
-  transition:
-    border-color 0.15s var(--ease),
-    background-color 0.15s var(--ease);
+  color: var(--text);
+  transition: background-color 0.15s var(--ease);
 }
 
 .dropzone:hover,
 .dropzone.over {
-  border-color: var(--accent);
   background: var(--accent-tint);
 }
 
 .dropzone .icon {
-  color: var(--text-faint);
+  color: var(--accent-text);
 }
 
 .key-button {
   position: relative;
   flex: none;
-  width: 56px;
-  min-height: 56px;
+  height: auto;
+  align-self: stretch;
   align-items: center;
-  justify-content: center;
-  border-radius: 12px;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--accent-text);
+  gap: 6px;
+  padding: 0 16px;
+  border: none;
+  border-left: 1px solid var(--border);
+  border-radius: 0;
+  background: none;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.key-button:hover:not(:disabled),
+.key-button.on {
+  background: var(--sunken);
+  color: var(--text);
 }
 
 .key-button .icon {
@@ -494,22 +498,10 @@ input[type="number"]::-webkit-outer-spin-button {
   stroke: none;
 }
 
-.key-button.on {
-  border-color: var(--accent);
-  background: var(--accent-tint);
-}
-
-.key-button.needs-key {
-  color: var(--text-faint);
-}
-
 .key-button.needs-key::after {
   content: "";
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
   background: var(--warning);
 }
@@ -520,7 +512,7 @@ input[type="number"]::-webkit-outer-spin-button {
 
 .dropzone b {
   font-size: 15px;
-  color: var(--text);
+  font-weight: 500;
 }
 
 .photos {
@@ -1546,5 +1538,13 @@ tfoot tr.total-row td {
 
   tfoot td {
     padding: 0 8px;
+  }
+}
+
+@supports (-webkit-touch-callout: none) {
+  input,
+  select,
+  textarea {
+    font-size: 16px !important;
   }
 }
