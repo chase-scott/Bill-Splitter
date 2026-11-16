@@ -274,7 +274,7 @@ function parseReceipt(text) {
   return JSON.parse(text.slice(start, end + 1));
 }
 
-async function shrinkImage(file, maxSide = 1800) {
+async function shrinkImage(file, maxSide = 1400) {
   try {
     const bitmap = await createImageBitmap(file);
     const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
@@ -282,7 +282,7 @@ async function shrinkImage(file, maxSide = 1800) {
     canvas.width = Math.round(bitmap.width * scale);
     canvas.height = Math.round(bitmap.height * scale);
     canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-    return await new Promise((resolve) => canvas.toBlob((blob) => resolve(blob || file), "image/jpeg", 0.85));
+    return await new Promise((resolve) => canvas.toBlob((blob) => resolve(blob || file), "image/jpeg", 0.72));
   } catch {
     return file;
   }
@@ -600,6 +600,9 @@ const ICONS = {
   copy: '<rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
   plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
   alert: '<circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/>',
+  found: '<circle cx="12" cy="12" r="9"/><path d="m8.5 12 2.5 2.5 4.5-5"/>',
+  missing: '<circle cx="12" cy="12" r="9" stroke-dasharray="3 3"/>',
+  sparkle: '<path d="M12 3c.5 4.6 4.4 8.5 9 9-4.6.5-8.5 4.4-9 9-.5-4.6-4.4-8.5-9-9 4.6-.5 8.5-4.4 9-9z"/>',
 };
 
 function icon(name, size = 16) {
@@ -619,11 +622,13 @@ function shareBar(weights, size = "") {
 
 const notice = (text) => `<p class="notice">${icon("alert")}<span>${text}</span></p>`;
 
-function productImage(url, size) {
+function productImage(url, size, fit = "cover") {
   const style = `width:${size * 2}px;height:${size * 2}px`;
   if (!url) return `<span class="product-image placeholder" style="${style}"></span>`;
-  return `<canvas class="product-image" width="${size * 4}" height="${size * 4}" data-img="${escapeHtml(url)}" style="${style}"></canvas>`;
+  return `<canvas class="product-image" width="${size * 4}" height="${size * 4}" data-img="${escapeHtml(url)}" data-fit="${fit}" style="${style}"></canvas>`;
 }
+
+const largeImage = (url) => url.replace(/\.(100|200)\.jpg$/, ".400.jpg");
 
 function productHtml(item, mode) {
   const product = item.off;
@@ -631,20 +636,28 @@ function productHtml(item, mode) {
   const name = escapeHtml(product?.name || "Unnamed product");
 
   if (mode === "row") {
-    if (item.offs === "pending") return '<span class="spinner"></span><span class="muted">Looking up</span>';
-    if (product)
-      return `${productImage(product.img, 10)}<span>${name}${detail ? ` <span class="muted">${escapeHtml(detail)}</span>` : ""}</span>`;
-    if (item.offs === "none") return '<span class="muted">Not in Open Food Facts</span>';
+    if (item.offs === "pending") return '<span class="spinner" title="Looking up"></span>';
+    if (product) return `<span class="lookup found" title="${name}">${icon("found", 14)}</span>`;
+    if (item.offs === "none")
+      return `<span class="lookup missing" title="Not in Open Food Facts">${icon("missing", 14)}</span>`;
     return "";
   }
 
-  if (mode === "card") {
+  if (mode === "slip") {
+    const price = (toCents(item.price) / 100).toFixed(2);
     if (product) {
-      return `<div class="product-card">${productImage(product.img, 24)}<div><div class="product-name">${name}</div>${detail ? `<div class="muted small">${escapeHtml(detail)}</div>` : ""}</div></div>`;
+      return `<div class="slip-hero">
+        ${productImage(product.img ? largeImage(product.img) : "", 56, "contain")}
+        <div class="slip-hero-text">
+          <div class="slip-hero-name">${name}</div>
+          ${detail ? `<div class="slip-hero-detail">${escapeHtml(detail)}</div>` : ""}
+          <div class="slip-hero-price">${price}</div>
+        </div>
+      </div>`;
     }
-    if (item.offs === "pending")
-      return '<div class="product-card muted small"><span class="spinner"></span>Looking up product</div>';
-    return "";
+    return `<div class="slip-line"><span class="slip-name">${escapeHtml(item.name)}</span><span class="slip-price">${price}</span></div>
+      ${item.code ? `<div class="slip-code">${escapeHtml(item.code)}</div>` : ""}
+      ${item.offs === "pending" ? '<div class="slip-looking"><span class="spinner"></span>Looking up product</div>' : ""}`;
   }
 
   if (product) {
@@ -670,7 +683,8 @@ function drawProductImages() {
     const draw = (img) => {
       const size = canvas.width;
       const ctx = canvas.getContext("2d");
-      const scale = Math.max(size / img.naturalWidth, size / img.naturalHeight);
+      const fit = canvas.dataset.fit === "contain" ? Math.min : Math.max;
+      const scale = fit(size / img.naturalWidth, size / img.naturalHeight);
       const w = img.naturalWidth * scale;
       const h = img.naturalHeight * scale;
       ctx.fillStyle = "#fff";
@@ -694,18 +708,7 @@ function drawProductImages() {
   });
 }
 
-function renderNav() {
-  const hasItems = allItems().length > 0;
-  byId("steps").innerHTML = ["Receipts", "Split", "Paid", "Summary"]
-    .map(
-      (label, i) =>
-        `<button data-go="${i + 1}" class="${state.step === i + 1 ? "on" : ""}" ${i && !hasItems ? "disabled" : ""}>${label}</button>`,
-    )
-    .join("");
-}
-
 function render() {
-  renderNav();
   const views = { 1: receiptsView, 2: splitView, 3: paidView, 4: summaryView };
   byId("main").innerHTML = (views[state.step] || receiptsView)();
   drawProductImages();
@@ -734,18 +737,15 @@ function receiptFooter(receipt) {
   return `<span class="muted">${plural(receipt.items.length, "item")}</span><b class="num">${formatMoney(sum)}</b>${check}<span class="spacer"></span><button class="link" data-add-item="${receipt.id}">${icon("plus")}Add item</button>`;
 }
 
-let settingsOpen = false;
+let keyOpen = false;
 
-function settingsHtml() {
-  const open = settingsOpen || !canReadPhotos();
-  return `<details class="settings" id="settings" ${open ? "open" : ""}>
-    <summary>${icon("camera")}<span>Photo reading</span><span class="spacer"></span><span class="muted small" id="key-status">${settings.key ? "Google Gemini" : "Not set up"}</span></summary>
-    <div class="settings-body">
-      <label for="gemini-key">Google AI Studio API key</label>
-      <input id="gemini-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your key" value="${escapeHtml(settings.key)}">
-      <p class="small muted">Get a free key at aistudio.google.com/apikey. It's stored only in this browser. Receipt photos are sent to Google, and on the free tier Google may use them to improve its products.</p>
-    </div>
-  </details>`;
+function keyPanelHtml() {
+  if (!keyOpen && canReadPhotos()) return "";
+  return `<div class="key-panel">
+    <label for="gemini-key">Google AI Studio API key</label>
+    <input id="gemini-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your key" value="${escapeHtml(settings.key)}">
+    <p class="small muted">${canReadPhotos() ? "" : "Needed to read receipt photos. Without it, enter items by hand. "}Get a free key at aistudio.google.com/apikey. It's stored only in this browser. Receipt photos are sent to Google, and on the free tier Google may use them to improve its products.</p>
+  </div>`;
 }
 
 function photoHtml(photo) {
@@ -794,19 +794,18 @@ function receiptsView() {
   const itemCount = allItems().length;
   const unread = photos.filter((p) => p.status === "new" || p.status === "error").length;
 
-  let html = `<label class="dropzone" id="dropzone">
-    <input type="file" id="file" accept="image/*" multiple>
-    ${icon("camera", 20)}
-    <b>Add receipt photos</b>
-    <span class="muted">One photo per receipt, from your camera or library</span>
-  </label>`;
+  const keyLabel = canReadPhotos() ? "Gemini key" : "Add a Gemini key";
+  let html = `<div class="add-row">
+    <label class="dropzone" id="dropzone">
+      <input type="file" id="file" accept="image/*" multiple>
+      ${icon("camera", 20)}
+      <b>Add receipt photos</b>
+    </label>
+    <button class="key-button${canReadPhotos() ? "" : " needs-key"}${keyOpen ? " on" : ""}" id="toggle-key" aria-label="${keyLabel}" title="${keyLabel}" aria-expanded="${keyOpen || !canReadPhotos()}">${icon("sparkle", 20)}</button>
+  </div>`;
 
+  html += keyPanelHtml();
   if (photos.length) html += `<div class="photos">${photos.map(photoHtml).join("")}</div>`;
-
-  html += settingsHtml();
-  if (!canReadPhotos()) {
-    html += notice("Add a free Google AI Studio key in Photo reading above to read photos, or enter the items by hand");
-  }
 
   if (unread && canReadPhotos()) {
     html += `<div class="row spaced">
@@ -918,9 +917,7 @@ function splitView() {
     <div class="slip-wrap${enterClass}" id="slip-wrap">
       <div class="slip${split.customOpen ? " editing" : ""}">
         <div class="slip-header"><span>${escapeHtml(item.receipt.name)}</span><span>${position(state.cur + 1)}/${position(items.length)}</span></div>
-        <div class="slip-line"><span class="slip-name">${escapeHtml(item.name)}</span><span class="slip-price">${(price / 100).toFixed(2)}</span></div>
-        ${item.code ? `<div class="slip-code">${escapeHtml(item.code)}</div>` : ""}
-        <div class="slip-product" data-product="${item.id}" data-mode="card">${productHtml(item, "card")}</div>
+        <div data-product="${item.id}" data-mode="slip">${productHtml(item, "slip")}</div>
         <div class="slip-share">${slipShareHtml(item, animate)}</div>
       </div>
     </div>
@@ -1100,14 +1097,19 @@ function summaryView() {
   const transfers = settleUp(t.balance);
   const paidTotal = t.paid.reduce((a, b) => a + b, 0);
   const owedTotal = t.owes.reduce((a, b) => a + b, 0);
-  const dotted = (left, right) => `<div class="slip-row"><span>${left}</span><i></i><span>${right}</span></div>`;
 
   let settleLines;
-  if (!paidTotal) settleLines = '<div class="slip-row"><span>No payments entered yet</span></div>';
-  else if (!transfers.length) settleLines = '<div class="slip-row"><span>Everyone is settled up</span></div>';
-  else {
+  if (!paidTotal) {
+    settleLines =
+      '<div class="transfer muted">No payments entered yet<button class="link" data-go="3">Add who paid</button></div>';
+  } else if (!transfers.length) {
+    settleLines = '<div class="transfer muted">Everyone is settled up</div>';
+  } else {
     settleLines = transfers
-      .map(({ from, to, amount }) => dotted(`${PEOPLE[from].name} → ${PEOPLE[to].name}`, (amount / 100).toFixed(2)))
+      .map(
+        ({ from, to, amount }) =>
+          `<div class="transfer"><span>${personDot(from)}${PEOPLE[from].name}</span><span class="muted">pays</span><span>${personDot(to)}${PEOPLE[to].name}</span><b class="num">${formatMoney(amount)}</b></div>`,
+      )
       .join("");
   }
 
@@ -1116,14 +1118,7 @@ function summaryView() {
     html += `<p class="notice">${icon("alert")}<span>${plural(t.unsplitCount, "item")} (${formatMoney(t.unsplitTotal)}) not split yet</span><button class="link" data-first-unsplit>Split ${t.unsplitCount > 1 ? "them" : "it"}</button></p>`;
   }
 
-  html += `<div class="slip-wrap stub"><div class="slip">
-    <div class="slip-header"><span>Settle up</span><span>${plural(state.receipts.length, "receipt")}</span></div>
-    ${settleLines}
-    <div class="slip-total">${dotted("Total shared", (owedTotal / 100).toFixed(2))}</div>
-  </div></div>`;
-
-  if (!paidTotal) html += '<p class="small center"><button class="link" data-go="3">Add who paid</button></p>';
-  else if (Math.abs(paidTotal - owedTotal) > 2) {
+  if (paidTotal && Math.abs(paidTotal - owedTotal) > 2) {
     html += notice(`Paid ${formatMoney(paidTotal)} but the shares add up to ${formatMoney(owedTotal)}`);
   }
 
@@ -1137,6 +1132,7 @@ function summaryView() {
     ${shareBar(t.owes, "medium")}
     <div class="people-row head"><span></span><span>Share</span><span>Paid</span><span>Balance</span></div>
     ${peopleRows}
+    <div class="transfers">${settleLines}</div>
   </div>`;
 
   let index = 0;
@@ -1152,12 +1148,15 @@ function summaryView() {
             return `<td class="amount num">${formatMoney(share)}${percent}</td>`;
           })
           .join("");
-        return `<tr class="line ${item.pct ? "" : "unsplit"}" data-jump="${index++}" title="Change split">
-          <td><span data-product="${item.id}" data-mode="cell">${productHtml(item, "cell")}</span>${shareBar(item.pct, "thin")}</td>
-          <td class="amount num">${formatMoney(price)}</td>${cells}
-        </tr>`;
+        return `<tbody class="line${item.pct ? "" : " unsplit"}" data-jump="${index++}" title="Change split">
+          <tr>
+            <td><span data-product="${item.id}" data-mode="cell">${productHtml(item, "cell")}</span></td>
+            <td class="amount num">${formatMoney(price)}</td>${cells}
+          </tr>
+          <tr class="bar-row"><td colspan="5">${shareBar(item.pct, "thin")}</td></tr>
+        </tbody>`;
       });
-      return `<tr class="store-row"><td colspan="5">${escapeHtml(receipt.name)}</td></tr>${lines.join("")}`;
+      return `<tbody><tr class="store-row"><td colspan="5">${escapeHtml(receipt.name)}</td></tr></tbody>${lines.join("")}`;
     })
     .join("");
 
@@ -1172,7 +1171,7 @@ function summaryView() {
   html += `<div class="section-head"><h2>Items</h2><span class="muted small">Tap an item to change its split</span></div>
     <table>
       <thead><tr><th>Item</th><th>Price</th>${headCells}</tr></thead>
-      <tbody>${rows}</tbody>
+      ${rows}
       <tfoot>
         ${totalRow("Items", t.subtotal.map(formatMoney), formatMoney(t.itemsTotal))}
         ${totalRow(`Tax ${toNumber(state.tax)}%`, t.tax.map(formatMoney), formatMoney(t.itemsTotalWithTax - t.itemsTotal))}
@@ -1308,6 +1307,12 @@ const clickHandlers = {
 const clickById = {
   "read-all": () => readAllPhotos(),
 
+  "toggle-key": () => {
+    keyOpen = !keyOpen;
+    render();
+    if (keyOpen) byId("gemini-key")?.focus();
+  },
+
   "add-manual": () => {
     state.receipts.push({
       id: newId(),
@@ -1355,14 +1360,6 @@ document.addEventListener("click", (event) => {
   if (action) clickHandlers[action](target);
 });
 
-document.addEventListener(
-  "toggle",
-  (event) => {
-    if (event.target.id === "settings") settingsOpen = event.target.open;
-  },
-  true,
-);
-
 document.addEventListener("input", (event) => {
   const el = event.target;
   const data = el.dataset;
@@ -1370,7 +1367,6 @@ document.addEventListener("input", (event) => {
   if (el.id === "gemini-key") {
     settings.key = el.value.trim();
     saveSettings();
-    byId("key-status").textContent = settings.key ? "Google Gemini" : "Not set up";
     return;
   }
   if (el.id === "file") {
