@@ -7,13 +7,13 @@ const PEOPLE = [
 const THIRD = 100 / 3;
 
 const SPLIT_PRESETS = [
-  { label: "Everyone", hint: "Split 3 ways", percents: [THIRD, THIRD, THIRD] },
-  { label: "Chase", hint: "100%", percents: [100, 0, 0] },
-  { label: "Michaelah", hint: "100%", percents: [0, 100, 0] },
-  { label: "Emily", hint: "100%", percents: [0, 0, 100] },
-  { label: "Chase + Michaelah", hint: "50 / 50", percents: [50, 50, 0] },
-  { label: "Chase + Emily", hint: "50 / 50", percents: [50, 0, 50] },
-  { label: "Michaelah + Emily", hint: "50 / 50", percents: [0, 50, 50] },
+  { label: "Everyone", short: "Everyone", percents: [THIRD, THIRD, THIRD] },
+  { label: "Chase", short: "Chase", percents: [100, 0, 0] },
+  { label: "Michaelah", short: "Michaelah", percents: [0, 100, 0] },
+  { label: "Emily", short: "Emily", percents: [0, 0, 100] },
+  { label: "Chase + Michaelah", short: "C + M", percents: [50, 50, 0] },
+  { label: "Chase + Emily", short: "C + E", percents: [50, 0, 50] },
+  { label: "Michaelah + Emily", short: "M + E", percents: [0, 50, 50] },
 ];
 
 const RECEIPT_PROMPT = `You are reading a photo of a store receipt. Extract every purchased line item.
@@ -622,10 +622,10 @@ function shareBar(weights, size = "") {
 
 const notice = (text) => `<p class="notice">${icon("alert")}<span>${text}</span></p>`;
 
-function productImage(url, size, fit = "cover") {
+function productImage(url, size, fit = "cover", fallback = "") {
   const style = `width:${size * 2}px;height:${size * 2}px`;
   if (!url) return `<span class="product-image placeholder" style="${style}"></span>`;
-  return `<canvas class="product-image" width="${size * 4}" height="${size * 4}" data-img="${escapeHtml(url)}" data-fit="${fit}" style="${style}"></canvas>`;
+  return `<canvas class="product-image loading" width="${size * 4}" height="${size * 4}" data-img="${escapeHtml(url)}" data-fit="${fit}"${fallback && fallback !== url ? ` data-fallback="${escapeHtml(fallback)}"` : ""} style="${style}"></canvas>`;
 }
 
 const largeImage = (url) => url.replace(/\.(100|200)\.jpg$/, ".400.jpg");
@@ -647,7 +647,7 @@ function productHtml(item, mode) {
     const price = formatMoney(toCents(item.price));
     if (product) {
       return `<div class="slip-hero">
-        ${productImage(product.img ? largeImage(product.img) : "", 56, "contain")}
+        ${productImage(product.img ? largeImage(product.img) : "", 56, "contain", product.img)}
         <div class="slip-hero-text">
           <div class="slip-hero-name">${name}</div>
           ${detail ? `<div class="slip-hero-detail">${escapeHtml(detail)}</div>` : ""}
@@ -690,6 +690,7 @@ function drawProductImages() {
       ctx.fillStyle = "#fff";
       ctx.fillRect(0, 0, size, size);
       ctx.drawImage(img, (size - w) / 2, (size - h) / 2, w, h);
+      canvas.classList.remove("loading");
     };
 
     let entry = loadedImages[url];
@@ -700,11 +701,25 @@ function drawProductImages() {
         entry.waiting.forEach((fn) => fn());
         entry.waiting = [];
       };
-      entry.img.onerror = () => (entry.waiting = []);
+      entry.img.onerror = () => {
+        entry.failed = true;
+        entry.waiting.forEach((fn) => fn());
+        entry.waiting = [];
+      };
       entry.img.src = url;
     }
-    if (entry.ready) draw(entry.img);
-    else entry.waiting.push(() => canvas.isConnected && draw(entry.img));
+    const finish = () => {
+      if (!entry.failed) return draw(entry.img);
+      if (canvas.dataset.fallback) {
+        canvas.dataset.img = canvas.dataset.fallback;
+        delete canvas.dataset.fallback;
+        delete canvas.dataset.drawn;
+        return drawProductImages();
+      }
+      canvas.classList.replace("loading", "failed");
+    };
+    if (entry.ready || entry.failed) finish();
+    else entry.waiting.push(() => canvas.isConnected && finish());
   });
 }
 
@@ -893,20 +908,24 @@ function splitView() {
   const presetsHtml = split.customOpen
     ? ""
     : `<div class="presets">${SPLIT_PRESETS.map(
-        (p, i) => `<button data-preset="${i}" class="${i === 0 ? "wide " : ""}${preset === i ? "on" : ""}">
+        (p, i) => `<button data-preset="${i}" class="${preset === i ? "on" : ""}" aria-label="${p.label}">
           ${shareBar(p.percents)}
-          <span class="preset-label"><b>${p.label}</b><span>${p.hint}</span></span>
+          <span class="preset-label">${p.short}</span>
           <kbd>${i + 1}</kbd>
         </button>`,
-      ).join("")}</div>`;
+      ).join("")}
+        <button data-custom-toggle class="${item.pct && preset < 0 ? "on" : ""}">
+          ${shareBar(null)}
+          <span class="preset-label">Custom</span>
+          <kbd>8</kbd>
+        </button>
+      </div>`;
 
   const forwardLabel = isLast ? "Finish" : item.pct ? "Next" : "Skip";
   const forwardButton = split.customOpen
     ? `<button class="primary" id="save-custom">Save split${icon("right")}</button>`
     : `<button data-move="1">${forwardLabel}${icon("right")}</button>`;
-  const customButton = split.customOpen
-    ? "<button data-custom-toggle>Cancel</button>"
-    : "<button data-custom-toggle>Custom split<kbd>8</kbd></button>";
+  const customButton = split.customOpen ? "<button data-custom-toggle>Cancel</button>" : "";
 
   const progress = (doneCount / items.length).toFixed(4);
   const left = items.length - doneCount;
