@@ -34,7 +34,7 @@ const GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flas
 const STORAGE_KEYS = {
   state: "roommate-split-app-v1",
   settings: "roommate-gemini-v1",
-  products: "off-cache-v1",
+  products: "off-cache-v2",
 };
 
 function readStorage(key, fallback) {
@@ -70,6 +70,9 @@ function loadState() {
 let state = loadState();
 let settings = { key: "", ...readStorage(STORAGE_KEYS.settings, {}) };
 let productCache = readStorage(STORAGE_KEYS.products, {});
+try {
+  localStorage.removeItem("off-cache-v1");
+} catch {}
 
 let lastId = Math.max(0, ...state.receipts.flatMap((receipt) => [receipt.id, ...receipt.items.map((item) => item.id)]));
 const newId = () => ++lastId;
@@ -457,7 +460,12 @@ function itemsNeedingLookup() {
 function queueProductLookups() {
   for (const receipt of state.receipts) {
     for (const item of receipt.items) {
-      if (!hasLookupCode(item) || item.offs || productCache[item.code] === undefined) continue;
+      if (!hasLookupCode(item)) continue;
+      if (productCache[item.code] === undefined) {
+        if (item.offs === "none") delete item.offs;
+        continue;
+      }
+      if (item.offs) continue;
       if (productCache[item.code]) setProduct(item, productCache[item.code]);
       else setNoProduct(item);
     }
