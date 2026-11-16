@@ -1,0 +1,1460 @@
+const PEOPLE = [
+  { name: "Chase", short: "C", color: "var(--person-1)" },
+  { name: "Michaelah", short: "M", color: "var(--person-2)" },
+  { name: "Emily", short: "E", color: "var(--person-3)" },
+];
+
+const THIRD = 100 / 3;
+
+const SPLIT_PRESETS = [
+  { label: "Everyone", hint: "Split 3 ways", percents: [THIRD, THIRD, THIRD] },
+  { label: "Chase", hint: "100%", percents: [100, 0, 0] },
+  { label: "Michaelah", hint: "100%", percents: [0, 100, 0] },
+  { label: "Emily", hint: "100%", percents: [0, 0, 100] },
+  { label: "Chase + Michaelah", hint: "50 / 50", percents: [50, 50, 0] },
+  { label: "Chase + Emily", hint: "50 / 50", percents: [50, 0, 50] },
+  { label: "Michaelah + Emily", hint: "50 / 50", percents: [0, 50, 50] },
+];
+
+const RECEIPT_PROMPT = `You are reading a photo of a store receipt. Extract every purchased line item.
+Return ONLY a JSON object, no other text, in exactly this shape:
+{"store":"<store name, or empty string>","items":[{"name":"<item text as printed>","code":"<product number printed on that line, digits only, or empty string>","price":<number>}],"subtotal":<pre-tax subtotal as a number, or null>}
+Rules:
+- code is the UPC / product / item number printed on the same line as the item (often 8-13 digits before or after the name). Copy every digit exactly; use "" if there is none.
+- price is the final amount charged for that line, as a plain number without $ (e.g. 4.96).
+- If a line has a discount, coupon or instant savings, subtract it from that item's price. If you can't tell which item it belongs to, add it as its own item with a negative price.
+- Weighed items: keep the weight detail in the name, e.g. "BANANAS (1.470 kg @ $1.50/kg)".
+- An item printed on two separate lines appears twice. If one line shows a quantity (e.g. "2 @ 3.97"), give one item with the line total and keep the quantity in the name.
+- Include deposits and eco/environmental fees as items.
+- Do NOT include subtotal, tax (HST/GST/PST), total, payment, change, points or savings-summary lines.
+- If part of the receipt is unreadable, include only what you can read.`;
+
+const GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-latest"];
+
+const STORAGE_KEYS = {
+  state: "roommate-split-app-v1",
+  settings: "roommate-gemini-v1",
+  products: "off-cache-v1",
+};
+
+function readStorage(key, fallback) {
+  try {
+    return JSON.parse(localStorage.getItem(key)) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStorage(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {}
+}
+
+function emptyState() {
+  return { step: 1, receipts: [], cur: 0, paid: ["", "", ""], paidBy: {}, tax: 13 };
+}
+
+function loadState() {
+  const saved = readStorage(STORAGE_KEYS.state, null);
+  if (!saved || !Array.isArray(saved.receipts)) return emptyState();
+  saved.paidBy = saved.paidBy || {};
+  saved.receipts.forEach((receipt) =>
+    receipt.items.forEach((item) => {
+      if (item.offs === "pending") delete item.offs;
+    }),
+  );
+  return saved;
+}
+
+let state = loadState();
+let settings = { key: "", ...readStorage(STORAGE_KEYS.settings, {}) };
+let productCache = readStorage(STORAGE_KEYS.products, {});
+
+let lastId = Math.max(0, ...state.receipts.flatMap((receipt) => [receipt.id, ...receipt.items.map((item) => item.id)]));
+const newId = () => ++lastId;
+
+const saveState = () => writeStorage(STORAGE_KEYS.state, state);
+const saveSettings = () => writeStorage(STORAGE_KEYS.settings, settings);
+const saveProductCache = () => writeStorage(STORAGE_KEYS.products, productCache);
+
+const byId = (id) => document.getElementById(id);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const prefersReducedMotion = () => window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+function toNumber(value) {
+  const n = parseFloat(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+const toCents = (value) => Math.round(toNumber(value) * 100);
+
+function formatMoney(cents) {
+  return (cents < 0 ? "-" : "") + "$" + (Math.abs(cents) / 100).toFixed(2);
+}
+
+function formatPercent(percent) {
+  const rounded = Math.round(percent * 100) / 100;
+  return (Math.abs(rounded - THIRD) < 0.01 ? "33.3" : String(rounded)) + "%";
+}
+
+function escapeHtml(value) {
+  const entities = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" };
+  return String(value ?? "").replace(/[&<>"]/g, (c) => entities[c]);
+}
+
+const plural = (count, word) => `${count} ${word}${count === 1 ? "" : "s"}`;
+
+function allItems() {
+  return state.receipts.flatMap((receipt) => receipt.items.map((item) => ({ ...item, receipt })));
+}
+
+function findItem(id) {
+  for (const receipt of state.receipts) {
+    const item = receipt.items.find((i) => i.id == id);
+    if (item) return [receipt, item];
+  }
+  return [];
+}
+
+function sameSplit(a, b) {
+  return a && b && a.every((value, i) => Math.abs(value - b[i]) < 0.01);
+}
+
+function presetIndex(percents) {
+  return SPLIT_PRESETS.findIndex((preset) => sameSplit(preset.percents, percents));
+}
+
+const receiptSubtotal = (receipt) => receipt.items.reduce((sum, item) => sum + toCents(item.price), 0);
+
+function splitCents(cents, percents) {
+  if (!percents) return [0, 0, 0];
+  const exact = percents.map((p) => (cents * p) / 100);
+  const shares = exact.map(Math.floor);
+  let leftover = cents - shares.reduce((a, b) => a + b, 0);
+  const order = [0, 1, 2].sort((a, b) => exact[b] - shares[b] - (exact[a] - shares[a]));
+  for (let k = 0; leftover > 0; k = (k + 1) % 3, leftover--) shares[order[k]]++;
+  return shares;
+}
+
+function totals() {
+  const subtotal = [0, 0, 0];
+  let itemsTotal = 0;
+  let unsplitTotal = 0;
+  let unsplitCount = 0;
+
+  for (const item of allItems()) {
+    const price = toCents(item.price);
+    itemsTotal += price;
+    if (!item.pct) {
+      unsplitTotal += price;
+      unsplitCount++;
+      continue;
+    }
+    splitCents(price, item.pct).forEach((share, i) => (subtotal[i] += share));
+  }
+
+  const rate = toNumber(state.tax) / 100;
+  const tax = subtotal.map((v) => Math.round(v * rate));
+  const owes = subtotal.map((v, i) => v + tax[i]);
+  const paid = state.paid.map(toCents);
+  const balance = paid.map((p, i) => p - owes[i]);
+
+  return {
+    subtotal,
+    tax,
+    owes,
+    paid,
+    balance,
+    itemsTotal,
+    itemsTotalWithTax: Math.round(itemsTotal * (1 + rate)),
+    unsplitTotal,
+    unsplitCount,
+  };
+}
+
+function settleUp(balance) {
+  const creditors = balance.map((b, i) => [i, b]).filter(([, b]) => b > 0);
+  const debtors = balance.map((b, i) => [i, -b]).filter(([, b]) => b > 0);
+  const transfers = [];
+  let c = 0;
+  let d = 0;
+  while (c < creditors.length && d < debtors.length) {
+    const amount = Math.min(creditors[c][1], debtors[d][1]);
+    if (amount > 0) transfers.push({ from: debtors[d][0], to: creditors[c][0], amount });
+    creditors[c][1] -= amount;
+    debtors[d][1] -= amount;
+    if (creditors[c][1] <= 0) c++;
+    if (debtors[d][1] <= 0) d++;
+  }
+  return transfers;
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",")[1]);
+    reader.onerror = () => reject(new Error("Couldn't read the photo"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+class ReadError extends Error {
+  constructor(message, code) {
+    super(message);
+    this.code = code;
+  }
+}
+
+async function readReceiptWithGemini(image) {
+  const body = JSON.stringify({
+    contents: [
+      {
+        role: "user",
+        parts: [
+          { text: RECEIPT_PROMPT },
+          { inline_data: { mime_type: image.type || "image/jpeg", data: await blobToBase64(image) } },
+        ],
+      },
+    ],
+    generationConfig: { temperature: 0, responseMimeType: "application/json" },
+  });
+
+  let lastError = new ReadError("No answer");
+  let rateLimited = false;
+
+  for (const model of GEMINI_MODELS) {
+    let response;
+    try {
+      response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": settings.key },
+        body,
+      });
+    } catch {
+      throw new ReadError("Can't reach Google. Check your connection");
+    }
+
+    const json = await response.json().catch(() => null);
+    const errorMessage = json?.error?.message ?? "";
+
+    if (response.ok) {
+      const text = (json?.candidates?.[0]?.content?.parts ?? []).map((part) => part.text ?? "").join("");
+      if (text) return text;
+      lastError = new ReadError(json?.promptFeedback?.blockReason ? "Blocked by Google" : "Empty answer");
+      continue;
+    }
+
+    const badKey =
+      response.status === 401 || response.status === 403 || (response.status === 400 && /api key/i.test(errorMessage));
+    if (badKey) throw new ReadError("Key rejected. Check it in Photo reading", "bad_key");
+
+    if (response.status === 429) {
+      rateLimited = true;
+      continue;
+    }
+    if (response.status === 404 || response.status >= 500) {
+      lastError = new ReadError(errorMessage || `Error ${response.status}`);
+      continue;
+    }
+    throw new ReadError((errorMessage || `Error ${response.status}`).slice(0, 80));
+  }
+
+  if (rateLimited) throw new ReadError("Free limit reached. Try again in a minute", "rate_limited");
+  throw lastError;
+}
+
+function parseReceipt(text) {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end < start) throw new ReadError("Couldn't read the receipt's answer");
+  return JSON.parse(text.slice(start, end + 1));
+}
+
+async function shrinkImage(file, maxSide = 1800) {
+  try {
+    const bitmap = await createImageBitmap(file);
+    const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(bitmap.width * scale);
+    canvas.height = Math.round(bitmap.height * scale);
+    canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    return await new Promise((resolve) => canvas.toBlob((blob) => resolve(blob || file), "image/jpeg", 0.85));
+  } catch {
+    return file;
+  }
+}
+
+async function makeThumbnail(file, width = 208, height = 224) {
+  try {
+    const bitmap = await createImageBitmap(file);
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const scale = Math.max(width / bitmap.width, height / bitmap.height);
+    const w = bitmap.width * scale;
+    const h = bitmap.height * scale;
+    canvas.getContext("2d").drawImage(bitmap, (width - w) / 2, (height - h) / 2, w, h);
+    return canvas.toDataURL("image/png");
+  } catch {
+    return URL.createObjectURL(file);
+  }
+}
+
+let photos = [];
+let reading = false;
+
+const canReadPhotos = () => Boolean(settings.key);
+
+function addPhotos(files) {
+  const images = [...files].filter((f) => f.type.startsWith("image/") || /\.(heic|heif)$/i.test(f.name));
+  for (const file of images) {
+    const photo = { id: newId(), file, url: "", status: "new" };
+    photos.push(photo);
+    makeThumbnail(file).then((url) => {
+      photo.url = url;
+      if (state.step === 1) render();
+    });
+  }
+  render();
+}
+
+async function readPhoto(photo) {
+  photo.status = "reading";
+  photo.message = "";
+  render();
+
+  try {
+    const receipt = parseReceipt(await readReceiptWithGemini(await shrinkImage(photo.file)));
+    const items = (Array.isArray(receipt.items) ? receipt.items : []).map((item) => ({
+      id: newId(),
+      name: String(item.name || "Item").trim(),
+      code: String(item.code ?? "").replace(/\D/g, ""),
+      price: (Math.round(toNumber(item.price) * 100) / 100).toFixed(2),
+      pct: null,
+    }));
+    if (!items.length) throw new ReadError("No items found");
+
+    const added = {
+      id: newId(),
+      name: String(receipt.store || "").trim() || `Receipt ${state.receipts.length + 1}`,
+      items,
+      subtotal: receipt.subtotal == null || receipt.subtotal === "" ? null : toNumber(receipt.subtotal),
+    };
+    state.receipts.push(added);
+    photo.status = "done";
+    photo.receiptId = added.id;
+    saveState();
+    queueProductLookups();
+  } catch (error) {
+    photo.status = "error";
+    photo.message =
+      error.code === "rate_limited" ? "Busy, retry in a moment" : (error.message || "Couldn't read").slice(0, 60);
+    render();
+    return error.code;
+  }
+  render();
+}
+
+async function readAllPhotos() {
+  if (reading || !canReadPhotos()) return;
+  reading = true;
+  for (const photo of photos.filter((p) => p.status === "new" || p.status === "error")) {
+    const code = await readPhoto(photo);
+    if (code === "rate_limited" || code === "bad_key") break;
+  }
+  reading = false;
+  render();
+}
+
+const PRODUCT_FIELDS =
+  "code,product_name,product_name_en,generic_name,brands,quantity,image_front_small_url,image_small_url";
+
+function checkDigit(digits) {
+  let sum = 0;
+  for (let i = digits.length - 1, weight = 3; i >= 0; i--, weight = 4 - weight) sum += Number(digits[i]) * weight;
+  return (10 - (sum % 10)) % 10;
+}
+
+const isValidBarcode = (code) => code.length >= 8 && checkDigit(code.slice(0, -1)) === Number(code.slice(-1));
+
+function barcodeCandidates(code) {
+  if (code.length === 14 && code[0] === "0") code = code.slice(1);
+  const out = [];
+  const add = (c) => c && !out.includes(c) && out.push(c);
+  if (isValidBarcode(code)) {
+    add(code);
+    if (code.length < 13) add(code.padStart(13, "0"));
+  } else {
+    if (code.length <= 12) add(code + checkDigit(code));
+    add(code);
+  }
+  return out.slice(0, 3);
+}
+
+const stripLeadingZeros = (code) => String(code || "").replace(/^0+/, "");
+
+function safeImageUrl(url) {
+  return typeof url === "string" && /^https:\/\/(images|static)\.openfoodfacts\.org\//.test(url) ? url : "";
+}
+
+function toProduct(raw, code) {
+  const name = String(raw.product_name_en || raw.product_name || raw.generic_name || "").trim();
+  const image = safeImageUrl(raw.image_front_small_url || raw.image_small_url);
+  if (!name && !image) return null;
+  return {
+    name: name.slice(0, 80),
+    brand: String(raw.brands || "")
+      .split(",")[0]
+      .trim()
+      .slice(0, 40),
+    qty: String(raw.quantity || "").slice(0, 20),
+    img: image,
+    code: String(code),
+  };
+}
+
+const lookup = {
+  busy: false,
+  waitUntil: 0,
+  timer: null,
+  failures: 0,
+  rateLimits: 0,
+  lastSearchAt: 0,
+  message: "",
+};
+
+function setLookupMessage(message) {
+  lookup.message = message;
+  const el = byId("lookup-status");
+  if (el) el.textContent = message;
+}
+
+function setProduct(item, product) {
+  item.off = product;
+  item.offs = "found";
+  productCache[item.code] = product;
+  updateProductViews(item);
+}
+
+function setNoProduct(item) {
+  delete item.off;
+  item.offs = "none";
+  productCache[item.code] = 0;
+  updateProductViews(item);
+}
+
+const hasLookupCode = (item) => item.code && item.code.length >= 8;
+
+function itemsNeedingLookup() {
+  return state.receipts
+    .flatMap((receipt) => receipt.items)
+    .filter((item) => hasLookupCode(item) && (!item.offs || item.offs === "pending"));
+}
+
+function queueProductLookups() {
+  for (const receipt of state.receipts) {
+    for (const item of receipt.items) {
+      if (!hasLookupCode(item) || item.offs || productCache[item.code] === undefined) continue;
+      if (productCache[item.code]) setProduct(item, productCache[item.code]);
+      else setNoProduct(item);
+    }
+  }
+  saveState();
+  runLookups();
+}
+
+function pauseLookups(seconds, reason) {
+  lookup.waitUntil = Date.now() + seconds * 1000;
+  for (const item of itemsNeedingLookup()) {
+    if (item.offs === "pending") {
+      delete item.offs;
+      updateProductViews(item);
+    }
+  }
+  clearInterval(lookup.timer);
+  lookup.timer = setInterval(() => {
+    const left = Math.ceil((lookup.waitUntil - Date.now()) / 1000);
+    if (left > 0) return setLookupMessage(`${reason}, trying again in ${left}s`);
+    clearInterval(lookup.timer);
+    lookup.timer = null;
+    runLookups();
+  }, 1000);
+}
+
+async function fetchProducts(url) {
+  try {
+    const response = await fetch(url);
+    lookup.failures = 0;
+    return response;
+  } catch {
+    lookup.failures++;
+    const offlineHint =
+      location.protocol === "file:"
+        ? " (if you opened this file from Files or a download preview, open it in Safari or Chrome instead)"
+        : "";
+    pauseLookups(
+      Math.min(300, 15 * 2 ** (lookup.failures - 1)),
+      lookup.failures >= 3 ? `Can't reach Open Food Facts${offlineHint}` : "Open Food Facts didn't answer",
+    );
+    return null;
+  }
+}
+
+async function runLookups() {
+  if (lookup.busy || lookup.waitUntil > Date.now()) return;
+  const batch = itemsNeedingLookup().slice(0, 30);
+  if (!batch.length) return setLookupMessage("");
+
+  lookup.busy = true;
+  try {
+    batch.forEach((item) => {
+      item.offs = "pending";
+      updateProductViews(item);
+    });
+
+    const itemsByCode = {};
+    const codes = new Set();
+    for (const item of batch) {
+      for (const candidate of barcodeCandidates(item.code)) {
+        codes.add(candidate);
+        if (candidate.length < 13) codes.add(candidate.padStart(13, "0"));
+        const key = stripLeadingZeros(candidate);
+        (itemsByCode[key] ||= []).push(item);
+      }
+    }
+
+    const wait = 7000 - (Date.now() - lookup.lastSearchAt);
+    if (wait > 0) {
+      setLookupMessage("Waiting to look up products");
+      await sleep(wait);
+    }
+    setLookupMessage(`Looking up ${plural(batch.length, "product")} on Open Food Facts`);
+    lookup.lastSearchAt = Date.now();
+
+    const response = await fetchProducts(
+      `https://world.openfoodfacts.org/api/v2/search?code=${[...codes].join(",")}&fields=${PRODUCT_FIELDS}&page_size=100`,
+    );
+    if (!response) return;
+
+    if (response.status === 429 || response.status === 503) {
+      const retryAfter = parseInt(response.headers.get("Retry-After"), 10);
+      lookup.rateLimits++;
+      const backoff = 30 * 2 ** (lookup.rateLimits - 1);
+      pauseLookups(
+        Math.min(300, Math.max(retryAfter > 0 ? retryAfter : 60, backoff)),
+        "Open Food Facts asked us to slow down",
+      );
+      return;
+    }
+    lookup.rateLimits = 0;
+
+    const json = response.ok ? await response.json().catch(() => null) : null;
+    if (!json) {
+      batch.forEach((item) => {
+        if (item.offs === "pending") {
+          delete item.offs;
+          updateProductViews(item);
+        }
+      });
+      setLookupMessage("Product lookup failed. Edit a code to try again");
+      return;
+    }
+
+    for (const raw of json.products ?? []) {
+      const product = toProduct(raw, raw.code);
+      if (!product) continue;
+      for (const item of itemsByCode[stripLeadingZeros(raw.code)] ?? []) {
+        if (item.offs === "pending") setProduct(item, product);
+      }
+    }
+    batch.forEach((item) => item.offs === "pending" && setNoProduct(item));
+    saveState();
+    saveProductCache();
+  } finally {
+    lookup.busy = false;
+  }
+
+  if (itemsNeedingLookup().some((item) => !item.offs)) runLookups();
+  else setLookupMessage("");
+}
+
+const ICONS = {
+  check: '<path d="M20 6 9 17l-5-5"/>',
+  x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+  left: '<path d="m12 19-7-7 7-7"/><path d="M19 12H5"/>',
+  right: '<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>',
+  camera:
+    '<path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/>',
+  barcode: '<path d="M3 5v14"/><path d="M8 5v14"/><path d="M12 5v14"/><path d="M17 5v14"/><path d="M21 5v14"/>',
+  copy: '<rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
+  plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
+  alert: '<circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/>',
+};
+
+function icon(name, size = 16) {
+  return `<svg class="icon" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
+}
+
+const personDot = (i) => `<span class="dot" style="background:${PEOPLE[i].color}"></span>`;
+
+function shareBar(weights, size = "") {
+  const total = weights ? weights.reduce((sum, w) => sum + Math.max(0, w), 0) : 0;
+  if (!total) return `<span class="share-bar empty ${size}"></span>`;
+  const segments = weights
+    .map((w, i) => (w > 0 ? `<i style="flex:${w};background:${PEOPLE[i].color}"></i>` : ""))
+    .join("");
+  return `<span class="share-bar ${size}">${segments}</span>`;
+}
+
+const notice = (text) => `<p class="notice">${icon("alert")}<span>${text}</span></p>`;
+
+function productImage(url, size) {
+  const style = `width:${size * 2}px;height:${size * 2}px`;
+  if (!url) return `<span class="product-image placeholder" style="${style}"></span>`;
+  return `<canvas class="product-image" width="${size * 4}" height="${size * 4}" data-img="${escapeHtml(url)}" style="${style}"></canvas>`;
+}
+
+function productHtml(item, mode) {
+  const product = item.off;
+  const detail = product ? [product.brand, product.qty].filter(Boolean).join(" · ") : "";
+  const name = escapeHtml(product?.name || "Unnamed product");
+
+  if (mode === "row") {
+    if (item.offs === "pending") return '<span class="spinner"></span><span class="muted">Looking up</span>';
+    if (product)
+      return `${productImage(product.img, 10)}<span>${name}${detail ? ` <span class="muted">${escapeHtml(detail)}</span>` : ""}</span>`;
+    if (item.offs === "none") return '<span class="muted">Not in Open Food Facts</span>';
+    return "";
+  }
+
+  if (mode === "card") {
+    if (product) {
+      return `<div class="product-card">${productImage(product.img, 24)}<div><div class="product-name">${name}</div>${detail ? `<div class="muted small">${escapeHtml(detail)}</div>` : ""}</div></div>`;
+    }
+    if (item.offs === "pending")
+      return '<div class="product-card muted small"><span class="spinner"></span>Looking up product</div>';
+    return "";
+  }
+
+  if (product) {
+    return `<span class="product-cell">${productImage(product.img, 12)}<span>${escapeHtml(product.name || item.name)}<span class="receipt-text num">${escapeHtml(item.name)}</span></span></span>`;
+  }
+  return `<span class="receipt-text-only num">${escapeHtml(item.name)}</span>`;
+}
+
+function updateProductViews(item) {
+  document.querySelectorAll(`[data-product="${item.id}"]`).forEach((el) => {
+    el.innerHTML = productHtml(item, el.dataset.mode);
+  });
+  drawProductImages();
+}
+
+const loadedImages = {};
+
+function drawProductImages() {
+  document.querySelectorAll("canvas.product-image[data-img]:not([data-drawn])").forEach((canvas) => {
+    canvas.dataset.drawn = "1";
+    const url = canvas.dataset.img;
+
+    const draw = (img) => {
+      const size = canvas.width;
+      const ctx = canvas.getContext("2d");
+      const scale = Math.max(size / img.naturalWidth, size / img.naturalHeight);
+      const w = img.naturalWidth * scale;
+      const h = img.naturalHeight * scale;
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, size, size);
+      ctx.drawImage(img, (size - w) / 2, (size - h) / 2, w, h);
+    };
+
+    let entry = loadedImages[url];
+    if (!entry) {
+      entry = loadedImages[url] = { img: new Image(), ready: false, waiting: [] };
+      entry.img.onload = () => {
+        entry.ready = true;
+        entry.waiting.forEach((fn) => fn());
+        entry.waiting = [];
+      };
+      entry.img.onerror = () => (entry.waiting = []);
+      entry.img.src = url;
+    }
+    if (entry.ready) draw(entry.img);
+    else entry.waiting.push(() => canvas.isConnected && draw(entry.img));
+  });
+}
+
+function renderNav() {
+  const hasItems = allItems().length > 0;
+  byId("steps").innerHTML = ["Receipts", "Split", "Paid", "Summary"]
+    .map(
+      (label, i) =>
+        `<button data-go="${i + 1}" class="${state.step === i + 1 ? "on" : ""}" ${i && !hasItems ? "disabled" : ""}>${label}</button>`,
+    )
+    .join("");
+}
+
+function render() {
+  renderNav();
+  const views = { 1: receiptsView, 2: splitView, 3: paidView, 4: summaryView };
+  byId("main").innerHTML = (views[state.step] || receiptsView)();
+  drawProductImages();
+  if (state.step === 2 && split.customOpen) updateCustomSplit();
+}
+
+function goToStep(step) {
+  cancelAdvance();
+  state.step = step;
+  saveState();
+  render();
+  window.scrollTo(0, 0);
+}
+
+function receiptFooter(receipt) {
+  const sum = receiptSubtotal(receipt);
+  let check = "";
+  if (receipt.subtotal != null) {
+    const printed = Math.round(receipt.subtotal * 100);
+    const diff = Math.abs(sum - printed);
+    check =
+      diff <= 1
+        ? '<span class="ok">Matches the receipt subtotal</span>'
+        : `<span class="bad">Receipt subtotal is ${formatMoney(printed)}, off by ${formatMoney(diff)}</span>`;
+  }
+  return `<span class="muted">${plural(receipt.items.length, "item")}</span><b class="num">${formatMoney(sum)}</b>${check}<span class="spacer"></span><button class="link" data-add-item="${receipt.id}">${icon("plus")}Add item</button>`;
+}
+
+let settingsOpen = false;
+
+function settingsHtml() {
+  const open = settingsOpen || !canReadPhotos();
+  return `<details class="settings" id="settings" ${open ? "open" : ""}>
+    <summary>${icon("camera")}<span>Photo reading</span><span class="spacer"></span><span class="muted small" id="key-status">${settings.key ? "Google Gemini" : "Not set up"}</span></summary>
+    <div class="settings-body">
+      <label for="gemini-key">Google AI Studio API key</label>
+      <input id="gemini-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your key" value="${escapeHtml(settings.key)}">
+      <p class="small muted">Get a free key at aistudio.google.com/apikey. It's stored only in this browser. Receipt photos are sent to Google, and on the free tier Google may use them to improve its products.</p>
+    </div>
+  </details>`;
+}
+
+function photoHtml(photo) {
+  const statusText =
+    {
+      new: '<span class="muted">Not read yet</span>',
+      reading: '<span><span class="spinner"></span>Reading</span>',
+      done: '<span class="ok">Read</span>',
+    }[photo.status] ??
+    `<span>${escapeHtml(photo.message)}</span><button class="link" data-retry="${photo.id}">Retry</button>`;
+
+  return `<div class="photo">
+    ${photo.url ? `<img src="${photo.url}" alt="">` : '<div class="photo-placeholder"></div>'}
+    ${photo.status !== "reading" ? `<button class="remove" data-remove-photo="${photo.id}" aria-label="Remove photo">${icon("x", 14)}</button>` : ""}
+    <div class="photo-status ${photo.status === "error" ? "error" : ""}">${statusText}</div>
+  </div>`;
+}
+
+function itemRowHtml(item) {
+  return `<div class="item" data-item="${item.id}">
+    <div class="item-main">
+      <input class="item-name num" data-field="name" value="${escapeHtml(item.name)}" placeholder="Item name" aria-label="Item name">
+      <span class="price-field"><i>$</i><input class="item-price num" data-field="price" type="number" inputmode="decimal" step="0.01" value="${escapeHtml(item.price)}" placeholder="0.00" aria-label="Price"></span>
+      <button class="remove" data-remove-item="${item.id}" aria-label="Remove item">${icon("x")}</button>
+    </div>
+    <div class="item-meta">
+      ${icon("barcode", 14)}
+      <input class="item-code num" data-field="code" inputmode="numeric" placeholder="Product code" value="${escapeHtml(item.code || "")}" aria-label="Product code">
+      <span class="product" data-product="${item.id}" data-mode="row">${productHtml(item, "row")}</span>
+    </div>
+  </div>`;
+}
+
+function receiptHtml(receipt) {
+  return `<div class="receipt" data-receipt="${receipt.id}">
+    <div class="receipt-header">
+      <input data-receipt-name value="${escapeHtml(receipt.name)}" aria-label="Store">
+      <button class="link quiet" data-remove-receipt="${receipt.id}">Remove</button>
+    </div>
+    ${receipt.items.map(itemRowHtml).join("")}
+    <div class="receipt-footer" id="receipt-footer-${receipt.id}">${receiptFooter(receipt)}</div>
+  </div>`;
+}
+
+function receiptsView() {
+  const itemCount = allItems().length;
+  const unread = photos.filter((p) => p.status === "new" || p.status === "error").length;
+
+  let html = `<label class="dropzone" id="dropzone">
+    <input type="file" id="file" accept="image/*" multiple>
+    ${icon("camera", 20)}
+    <b>Add receipt photos</b>
+    <span class="muted">One photo per receipt, from your camera or library</span>
+  </label>`;
+
+  if (photos.length) html += `<div class="photos">${photos.map(photoHtml).join("")}</div>`;
+
+  html += settingsHtml();
+  if (!canReadPhotos()) {
+    html += notice("Add a free Google AI Studio key in Photo reading above to read photos, or enter the items by hand");
+  }
+
+  if (unread && canReadPhotos()) {
+    html += `<div class="row spaced">
+      <button class="primary" id="read-all" ${reading ? "disabled" : ""}>${reading ? "Reading" : `Read ${plural(unread, "receipt")}`}</button>
+      <span class="muted small">Check what it finds against the paper receipt</span>
+    </div>`;
+  }
+
+  if (state.receipts.length) {
+    html += `<div class="section-head"><h2>Items</h2><span class="muted small" id="lookup-status">${escapeHtml(lookup.message)}</span></div>`;
+    html += state.receipts.map(receiptHtml).join("");
+  }
+
+  html += `<p class="small muted">No photo? <button class="link" id="add-manual">Enter a receipt by hand</button></p>`;
+  html += `<div class="footer-bar">
+    <span class="small muted">${plural(itemCount, "item")}</span>
+    <span class="spacer"></span>
+    ${state.receipts.length ? '<button id="start-over" class="link quiet">Start over</button>' : ""}
+    <button class="primary" data-go="2" ${itemCount ? "" : "disabled"}>Split items${icon("right")}</button>
+  </div>`;
+  return html;
+}
+
+const split = {
+  customOpen: false,
+  customFor: null,
+  advancing: false,
+  timer: null,
+  justChosen: false,
+  enterDirection: 0,
+};
+
+function slipShareHtml(item, animate) {
+  const price = toCents(item.price);
+  const percents = item.pct;
+
+  if (split.customOpen) {
+    const values =
+      percents && presetIndex(percents) < 0 ? percents.map((p) => String(Math.round(p * 100) / 100)) : ["", "", ""];
+    const rows = PEOPLE.map(
+      (person, i) => `<label class="custom-row">
+        ${personDot(i)}<span>${person.name}</span>
+        <span class="suffix-field"><input type="number" class="num" inputmode="decimal" min="0" max="100" step="any" data-custom-percent="${i}" value="${values[i]}"><span>%</span></span>
+        <b class="num" id="custom-amount-${i}"></b>
+      </label>`,
+    ).join("");
+    return `<span id="custom-bar">${shareBar(null, "thick")}</span>
+      <div class="custom-split">${rows}</div>
+      <div class="custom-hint" id="custom-hint">Leave a box empty to share what's left</div>`;
+  }
+
+  const shares = splitCents(price, percents);
+  const who = percents
+    ? PEOPLE.map((person, i) =>
+        percents[i] > 0 ? `<span>${personDot(i)}${person.name}<b>${formatMoney(shares[i])}</b></span>` : "",
+      ).join("")
+    : '<span class="muted">Not split yet</span>';
+  return `${shareBar(percents, "thick" + (animate ? " grow" : ""))}<div class="slip-who">${who}</div>`;
+}
+
+function splitView() {
+  const items = allItems();
+  if (!items.length) return "";
+
+  state.cur = Math.max(0, Math.min(state.cur, items.length - 1));
+  const item = items[state.cur];
+  const doneCount = items.filter((i) => i.pct).length;
+  const price = toCents(item.price);
+  const t = totals();
+  const preset = presetIndex(item.pct);
+  const isLast = state.cur === items.length - 1;
+
+  if (split.customFor !== item.id) {
+    split.customFor = item.id;
+    split.customOpen = Boolean(item.pct) && preset < 0;
+  }
+
+  const enterClass =
+    split.enterDirection && !prefersReducedMotion() ? (split.enterDirection > 0 ? " enter-right" : " enter-left") : "";
+  split.enterDirection = 0;
+  const animate = split.justChosen;
+  split.justChosen = false;
+
+  const position = (n) => String(n).padStart(2, "0");
+  const presetsHtml = split.customOpen
+    ? ""
+    : `<div class="presets">${SPLIT_PRESETS.map(
+        (p, i) => `<button data-preset="${i}" class="${i === 0 ? "wide " : ""}${preset === i ? "on" : ""}">
+          ${shareBar(p.percents)}
+          <span class="preset-label"><b>${p.label}</b><span>${p.hint}</span></span>
+          <kbd>${i + 1}</kbd>
+        </button>`,
+      ).join("")}</div>`;
+
+  const forwardLabel = isLast ? "Finish" : item.pct ? "Next" : "Skip";
+  const forwardButton = split.customOpen
+    ? `<button class="primary" id="save-custom">Save split${icon("right")}</button>`
+    : `<button data-move="1">${forwardLabel}${icon("right")}</button>`;
+  const customButton = split.customOpen
+    ? "<button data-custom-toggle>Cancel</button>"
+    : "<button data-custom-toggle>Custom split<kbd>8</kbd></button>";
+
+  const progress = (doneCount / items.length).toFixed(4);
+  const left = items.length - doneCount;
+
+  return `<div class="progress-label"><span>Item ${state.cur + 1} of ${items.length}</span><span>${doneCount} of ${items.length} split</span></div>
+    <div class="progress"><i style="transform:scaleX(${progress})"></i></div>
+
+    <div class="slip-wrap${enterClass}" id="slip-wrap">
+      <div class="slip${split.customOpen ? " editing" : ""}">
+        <div class="slip-header"><span>${escapeHtml(item.receipt.name)}</span><span>${position(state.cur + 1)}/${position(items.length)}</span></div>
+        <div class="slip-line"><span class="slip-name">${escapeHtml(item.name)}</span><span class="slip-price">${(price / 100).toFixed(2)}</span></div>
+        ${item.code ? `<div class="slip-code">${escapeHtml(item.code)}</div>` : ""}
+        <div class="slip-product" data-product="${item.id}" data-mode="card">${productHtml(item, "card")}</div>
+        <div class="slip-share">${slipShareHtml(item, animate)}</div>
+      </div>
+    </div>
+
+    ${presetsHtml}
+
+    <div class="item-nav">
+      <button data-move="-1" ${state.cur ? "" : "disabled"} aria-label="Previous item">${icon("left")}</button>
+      ${customButton}
+      <span class="spacer"></span>
+      ${forwardButton}
+    </div>
+
+    <div class="running-total">
+      <div class="row"><span class="muted small">Split so far, before tax</span></div>
+      ${shareBar(t.subtotal, "medium")}
+      <div class="running-names">${PEOPLE.map((p, i) => `<span>${personDot(i)}${p.name}<b class="num">${formatMoney(t.subtotal[i])}</b></span>`).join("")}</div>
+    </div>
+
+    <div class="footer-bar">
+      <button data-go="1">${icon("left")}Receipts</button>
+      <span class="spacer"></span>
+      <span class="small muted">${left ? `${left} left` : '<span class="ok">All split</span>'}</span>
+      <button class="${split.customOpen ? "" : "primary"}" data-go="3">Who paid${icon("right")}</button>
+    </div>`;
+}
+
+function readCustomSplit() {
+  const typed = [0, 1, 2].map((i) => {
+    const value = document.querySelector(`[data-custom-percent="${i}"]`)?.value.trim() ?? "";
+    return value === "" ? null : Math.max(0, toNumber(value));
+  });
+  const used = typed.reduce((sum, v) => sum + (v || 0), 0);
+  const blanks = typed.filter((v) => v === null).length;
+  const remaining = 100 - used;
+  const percents = typed.map((v) => (v === null ? (blanks ? Math.max(0, remaining) / blanks : 0) : v));
+  const valid = blanks ? remaining >= -0.005 : Math.abs(used - 100) < 0.01;
+  return { percents, typed, valid, used, blanks };
+}
+
+function updateCustomSplit() {
+  if (!byId("custom-hint")) return;
+  const item = allItems()[state.cur];
+  const price = toCents(item.price);
+  const custom = readCustomSplit();
+  const shares = custom.valid
+    ? splitCents(price, custom.percents)
+    : custom.percents.map((p) => Math.round((price * p) / 100));
+
+  custom.percents.forEach((p, i) => {
+    const input = document.querySelector(`[data-custom-percent="${i}"]`);
+    if (input) input.placeholder = custom.typed[i] === null ? String(Math.round(p * 10) / 10) : "0";
+    byId(`custom-amount-${i}`).textContent = formatMoney(shares[i]);
+  });
+
+  byId("custom-bar").innerHTML = shareBar(custom.valid ? custom.percents : null, "thick");
+  const used = Math.round(custom.used * 100) / 100;
+  byId("custom-hint").innerHTML = custom.valid
+    ? "Leave a box empty to share what's left"
+    : `<span class="bad">${custom.blanks ? `That's ${used}%, over 100%` : `Adds up to ${used}%, needs 100%`}</span>`;
+
+  const save = byId("save-custom");
+  if (save) save.disabled = !custom.valid;
+}
+
+function chooseSplit(percents) {
+  if (split.advancing) return;
+  const items = allItems();
+  const [, item] = findItem(items[state.cur].id);
+  item.pct = percents;
+  split.customOpen = false;
+  saveState();
+
+  split.justChosen = true;
+  render();
+  split.advancing = true;
+
+  const isLast = state.cur >= items.length - 1;
+  const reduced = prefersReducedMotion();
+  split.timer = setTimeout(
+    () => {
+      if (!reduced) byId("slip-wrap")?.classList.add("leave");
+      split.timer = setTimeout(
+        () => {
+          split.advancing = false;
+          split.timer = null;
+          if (isLast) return goToStep(3);
+          state.cur++;
+          split.enterDirection = 1;
+          saveState();
+          render();
+        },
+        reduced ? 0 : 160,
+      );
+    },
+    reduced ? 250 : 650,
+  );
+}
+
+function cancelAdvance() {
+  clearTimeout(split.timer);
+  split.timer = null;
+  split.advancing = false;
+}
+
+function paidView() {
+  const t = totals();
+  const rate = toNumber(state.tax) / 100;
+  const entered = t.paid.reduce((a, b) => a + b, 0);
+
+  const receiptRows = state.receipts
+    .map((receipt) => {
+      const total = Math.round(receiptSubtotal(receipt) * (1 + rate));
+      const choices = PEOPLE.map(
+        (person, i) =>
+          `<button data-paid-by="${receipt.id}:${i}" class="${state.paidBy[receipt.id] === i ? "on" : ""}">${personDot(i)}${person.name}</button>`,
+      ).join("");
+      return `<div class="payer-row"><span class="payer-store">${escapeHtml(receipt.name)}</span><span class="num muted">${formatMoney(total)}</span><span class="segmented">${choices}</span></div>`;
+    })
+    .join("");
+
+  const fields = PEOPLE.map(
+    (person, i) => `<label class="paid-field">
+      <span>${personDot(i)}${person.name} paid</span>
+      <span class="money-field"><i>$</i><input type="number" class="num" step="0.01" min="0" placeholder="0.00" data-paid="${i}" value="${escapeHtml(state.paid[i])}"></span>
+    </label>`,
+  ).join("");
+
+  setTimeout(updatePaidCheck, 0);
+
+  return `<p class="lead">What each person paid at the till, tax included. Pick who paid each receipt to fill it in</p>
+    <div class="panel">${receiptRows}</div>
+    <div class="paid-fields">${fields}</div>
+    <div class="tally">
+      <span class="muted">Total with tax</span><b class="num">${formatMoney(t.itemsTotalWithTax)}</b>
+      <span class="muted">Entered</span><b class="num" id="entered">${formatMoney(entered)}</b>
+      <span id="paid-check"></span>
+    </div>
+    <div class="row small tax-row">
+      <label for="tax" class="muted">Tax rate</label>
+      <span class="suffix-field"><input type="number" id="tax" class="num" step="0.5" min="0" value="${escapeHtml(state.tax)}"><span>%</span></span>
+      <span class="muted">on every item</span>
+    </div>
+    <div class="footer-bar">
+      <button data-go="2">${icon("left")}Split</button>
+      <span class="spacer"></span>
+      <button class="primary" data-go="4">Summary${icon("right")}</button>
+    </div>`;
+}
+
+function updatePaidCheck() {
+  if (!byId("paid-check")) return;
+  const t = totals();
+  const entered = t.paid.reduce((a, b) => a + b, 0);
+  const diff = t.itemsTotalWithTax - entered;
+  byId("entered").textContent = formatMoney(entered);
+  byId("paid-check").innerHTML =
+    entered === 0
+      ? ""
+      : Math.abs(diff) <= 2
+        ? '<span class="ok">Matches</span>'
+        : `<span class="bad">${formatMoney(Math.abs(diff))} ${diff > 0 ? "short" : "over"}</span>`;
+}
+
+function fillPaidFromReceipts() {
+  const rate = toNumber(state.tax) / 100;
+  const sums = [0, 0, 0];
+  for (const receipt of state.receipts) {
+    const payer = state.paidBy[receipt.id];
+    if (payer !== undefined) sums[payer] += Math.round(receiptSubtotal(receipt) * (1 + rate));
+  }
+  state.paid = sums.map((c) => (c ? (c / 100).toFixed(2) : ""));
+}
+
+function summaryView() {
+  const t = totals();
+  const transfers = settleUp(t.balance);
+  const paidTotal = t.paid.reduce((a, b) => a + b, 0);
+  const owedTotal = t.owes.reduce((a, b) => a + b, 0);
+  const dotted = (left, right) => `<div class="slip-row"><span>${left}</span><i></i><span>${right}</span></div>`;
+
+  let settleLines;
+  if (!paidTotal) settleLines = '<div class="slip-row"><span>No payments entered yet</span></div>';
+  else if (!transfers.length) settleLines = '<div class="slip-row"><span>Everyone is settled up</span></div>';
+  else {
+    settleLines = transfers
+      .map(({ from, to, amount }) => dotted(`${PEOPLE[from].name} → ${PEOPLE[to].name}`, (amount / 100).toFixed(2)))
+      .join("");
+  }
+
+  let html = "";
+  if (t.unsplitCount) {
+    html += `<p class="notice">${icon("alert")}<span>${plural(t.unsplitCount, "item")} (${formatMoney(t.unsplitTotal)}) not split yet</span><button class="link" data-first-unsplit>Split ${t.unsplitCount > 1 ? "them" : "it"}</button></p>`;
+  }
+
+  html += `<div class="slip-wrap stub"><div class="slip">
+    <div class="slip-header"><span>Settle up</span><span>${plural(state.receipts.length, "receipt")}</span></div>
+    ${settleLines}
+    <div class="slip-total">${dotted("Total shared", (owedTotal / 100).toFixed(2))}</div>
+  </div></div>`;
+
+  if (!paidTotal) html += '<p class="small center"><button class="link" data-go="3">Add who paid</button></p>';
+  else if (Math.abs(paidTotal - owedTotal) > 2) {
+    html += notice(`Paid ${formatMoney(paidTotal)} but the shares add up to ${formatMoney(owedTotal)}`);
+  }
+
+  const peopleRows = PEOPLE.map((person, i) => {
+    const balance = t.balance[i];
+    const tone = balance > 0 ? "positive" : balance < 0 ? "negative" : "";
+    return `<div class="people-row"><span>${personDot(i)}${person.name}</span><span class="num">${formatMoney(t.owes[i])}</span><span class="num">${formatMoney(t.paid[i])}</span><span class="num ${tone}">${balance > 0 ? "+" : ""}${formatMoney(balance)}</span></div>`;
+  }).join("");
+
+  html += `<div class="panel people">
+    ${shareBar(t.owes, "medium")}
+    <div class="people-row head"><span></span><span>Share</span><span>Paid</span><span>Balance</span></div>
+    ${peopleRows}
+  </div>`;
+
+  let index = 0;
+  const rows = state.receipts
+    .map((receipt) => {
+      const lines = receipt.items.map((item) => {
+        const price = toCents(item.price);
+        const shares = splitCents(price, item.pct);
+        const cells = shares
+          .map((share, i) => {
+            if (!item.pct || !item.pct[i]) return '<td class="amount num zero">–</td>';
+            const percent = item.pct[i] < 99.99 ? `<span class="percent">${formatPercent(item.pct[i])}</span>` : "";
+            return `<td class="amount num">${formatMoney(share)}${percent}</td>`;
+          })
+          .join("");
+        return `<tr class="line ${item.pct ? "" : "unsplit"}" data-jump="${index++}" title="Change split">
+          <td><span data-product="${item.id}" data-mode="cell">${productHtml(item, "cell")}</span>${shareBar(item.pct, "thin")}</td>
+          <td class="amount num">${formatMoney(price)}</td>${cells}
+        </tr>`;
+      });
+      return `<tr class="store-row"><td colspan="5">${escapeHtml(receipt.name)}</td></tr>${lines.join("")}`;
+    })
+    .join("");
+
+  const totalRow = (label, values, total = "", cls = "") =>
+    `<tr class="${cls}"><td>${label}</td><td class="amount num">${total}</td>${values.map((v) => `<td class="amount num">${v}</td>`).join("")}</tr>`;
+
+  const headCells = PEOPLE.map(
+    (person, i) =>
+      `<th>${personDot(i)}<span class="name-full">${person.name}</span><span class="name-short">${person.short}</span></th>`,
+  ).join("");
+
+  html += `<div class="section-head"><h2>Items</h2><span class="muted small">Tap an item to change its split</span></div>
+    <table>
+      <thead><tr><th>Item</th><th>Price</th>${headCells}</tr></thead>
+      <tbody>${rows}</tbody>
+      <tfoot>
+        ${totalRow("Items", t.subtotal.map(formatMoney), formatMoney(t.itemsTotal))}
+        ${totalRow(`Tax ${toNumber(state.tax)}%`, t.tax.map(formatMoney), formatMoney(t.itemsTotalWithTax - t.itemsTotal))}
+        ${totalRow("Share", t.owes.map(formatMoney), formatMoney(t.itemsTotalWithTax), "total-row")}
+      </tfoot>
+    </table>
+    <div class="footer-bar">
+      <button data-go="3">${icon("left")}Paid</button>
+      <span class="spacer"></span>
+      <button id="start-over" class="link quiet">Start over</button>
+      <button class="primary" id="copy-summary">${icon("copy")}Copy summary</button>
+    </div>`;
+  return html;
+}
+
+function summaryText() {
+  const t = totals();
+  const people = PEOPLE.map(
+    (person, i) =>
+      `${person.name}: share ${formatMoney(t.owes[i])} (items ${formatMoney(t.subtotal[i])} + tax ${formatMoney(t.tax[i])}), paid ${formatMoney(t.paid[i])}`,
+  ).join("\n");
+  const transfers = settleUp(t.balance);
+  const settle = transfers.length
+    ? transfers
+        .map(({ from, to, amount }) => `${PEOPLE[from].name} pays ${PEOPLE[to].name} ${formatMoney(amount)}`)
+        .join("\n")
+    : "Everyone is settled up";
+  return `${people}\n\n${settle}`;
+}
+
+function confirmTwice(button, prompt, label, action) {
+  if (button.dataset.armed) return action();
+  button.dataset.armed = "1";
+  button.textContent = prompt;
+  setTimeout(() => {
+    if (!button.isConnected) return;
+    delete button.dataset.armed;
+    button.textContent = label;
+  }, 3000);
+}
+
+const blankItem = () => ({ id: newId(), name: "", code: "", price: "", pct: null });
+
+const clickHandlers = {
+  go: (btn) => goToStep(Number(btn.dataset.go)),
+
+  retry: async (btn) => {
+    const photo = photos.find((p) => p.id == btn.dataset.retry);
+    if (!photo || reading) return;
+    reading = true;
+    await readPhoto(photo);
+    reading = false;
+    render();
+  },
+
+  removePhoto: (btn) => {
+    photos = photos.filter((p) => p.id != btn.dataset.removePhoto);
+    render();
+  },
+
+  removeItem: (btn) => {
+    for (const receipt of state.receipts) receipt.items = receipt.items.filter((i) => i.id != btn.dataset.removeItem);
+    saveState();
+    render();
+  },
+
+  addItem: (btn) => {
+    const receipt = state.receipts.find((r) => r.id == btn.dataset.addItem);
+    receipt.items.push(blankItem());
+    saveState();
+    render();
+    const names = document.querySelectorAll(`[data-receipt="${receipt.id}"] .item-name`);
+    names[names.length - 1]?.focus();
+  },
+
+  removeReceipt: (btn) =>
+    confirmTwice(btn, "Tap again to remove", "Remove", () => {
+      const id = btn.dataset.removeReceipt;
+      state.receipts = state.receipts.filter((r) => r.id != id);
+      photos = photos.filter((p) => p.receiptId != id);
+      saveState();
+      render();
+    }),
+
+  preset: (btn) => {
+    split.customOpen = false;
+    chooseSplit(SPLIT_PRESETS[Number(btn.dataset.preset)].percents.slice());
+  },
+
+  customToggle: () => {
+    if (split.advancing) return;
+    split.customOpen = !split.customOpen;
+    render();
+    if (split.customOpen) document.querySelector('[data-custom-percent="0"]')?.focus();
+  },
+
+  move: (btn) => {
+    cancelAdvance();
+    const step = Number(btn.dataset.move);
+    const next = state.cur + step;
+    if (next >= allItems().length) return goToStep(3);
+    if (next < 0) return;
+    state.cur = next;
+    split.enterDirection = step;
+    saveState();
+    render();
+  },
+
+  paidBy: (btn) => {
+    const [receiptId, person] = btn.dataset.paidBy.split(":").map(Number);
+    if (state.paidBy[receiptId] === person) delete state.paidBy[receiptId];
+    else state.paidBy[receiptId] = person;
+    fillPaidFromReceipts();
+    saveState();
+    render();
+  },
+
+  jump: (row) => {
+    state.cur = Number(row.dataset.jump);
+    split.customFor = null;
+    goToStep(2);
+  },
+
+  firstUnsplit: () => {
+    state.cur = Math.max(
+      0,
+      allItems().findIndex((i) => !i.pct),
+    );
+    goToStep(2);
+  },
+};
+
+const clickById = {
+  "read-all": () => readAllPhotos(),
+
+  "add-manual": () => {
+    state.receipts.push({
+      id: newId(),
+      name: `Receipt ${state.receipts.length + 1}`,
+      items: [blankItem()],
+      subtotal: null,
+    });
+    saveState();
+    render();
+  },
+
+  "start-over": (btn) =>
+    confirmTwice(btn, "Tap again to clear everything", "Start over", () => {
+      state = emptyState();
+      photos = [];
+      saveState();
+      render();
+      window.scrollTo(0, 0);
+    }),
+
+  "save-custom": () => {
+    const custom = readCustomSplit();
+    if (!custom.valid) return;
+    const preset = presetIndex(custom.percents);
+    split.customOpen = false;
+    chooseSplit(preset >= 0 ? SPLIT_PRESETS[preset].percents.slice() : custom.percents);
+  },
+
+  "copy-summary": async (btn) => {
+    try {
+      await navigator.clipboard.writeText(summaryText());
+      btn.innerHTML = `${icon("check")}Copied`;
+    } catch {
+      btn.textContent = "Copy blocked";
+    }
+    setTimeout(() => (btn.innerHTML = `${icon("copy")}Copy summary`), 1500);
+  },
+};
+
+document.addEventListener("click", (event) => {
+  const target = event.target.closest("button, [data-jump]");
+  if (!target) return;
+  if (clickById[target.id]) return clickById[target.id](target);
+  const action = Object.keys(clickHandlers).find((key) => key in target.dataset);
+  if (action) clickHandlers[action](target);
+});
+
+document.addEventListener(
+  "toggle",
+  (event) => {
+    if (event.target.id === "settings") settingsOpen = event.target.open;
+  },
+  true,
+);
+
+document.addEventListener("input", (event) => {
+  const el = event.target;
+  const data = el.dataset;
+
+  if (el.id === "gemini-key") {
+    settings.key = el.value.trim();
+    saveSettings();
+    byId("key-status").textContent = settings.key ? "Google Gemini" : "Not set up";
+    return;
+  }
+  if (el.id === "file") {
+    addPhotos(el.files);
+    el.value = "";
+    return;
+  }
+  if (data.field) {
+    const [receipt, item] = findItem(el.closest("[data-item]").dataset.item);
+    if (data.field === "code") {
+      item.code = el.value.replace(/\D/g, "");
+      delete item.off;
+      delete item.offs;
+    } else {
+      item[data.field] = el.value;
+      byId(`receipt-footer-${receipt.id}`).innerHTML = receiptFooter(receipt);
+    }
+    saveState();
+    return;
+  }
+  if ("receiptName" in data) {
+    state.receipts.find((r) => r.id == el.closest("[data-receipt]").dataset.receipt).name = el.value;
+    saveState();
+    return;
+  }
+  if ("customPercent" in data) return updateCustomSplit();
+  if ("paid" in data) {
+    state.paid[Number(data.paid)] = el.value;
+    saveState();
+    updatePaidCheck();
+    return;
+  }
+  if (el.id === "tax") {
+    state.tax = el.value;
+    saveState();
+  }
+});
+
+document.addEventListener("change", (event) => {
+  const el = event.target;
+  if (el.id === "gemini-key" || el.id === "tax") render();
+  if (el.dataset.field === "code") {
+    const [, item] = findItem(el.closest("[data-item]").dataset.item);
+    updateProductViews(item);
+    queueProductLookups();
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  if (state.step !== 2) return;
+  const el = event.target;
+
+  if (el.matches("input")) {
+    if (!("customPercent" in el.dataset)) return;
+    if (event.key === "Enter") byId("save-custom")?.click();
+    if (event.key === "Escape") {
+      split.customOpen = false;
+      render();
+    }
+    return;
+  }
+
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+
+  if (/^[1-7]$/.test(event.key)) {
+    event.preventDefault();
+    split.customOpen = false;
+    chooseSplit(SPLIT_PRESETS[Number(event.key) - 1].percents.slice());
+  } else if (event.key === "8") {
+    event.preventDefault();
+    document.querySelector("[data-custom-toggle]")?.click();
+  } else if (event.key === "ArrowRight") {
+    document.querySelector('[data-move="1"]')?.click();
+  } else if (event.key === "ArrowLeft" && state.cur > 0) {
+    document.querySelector('[data-move="-1"]')?.click();
+  }
+});
+
+for (const type of ["dragover", "dragenter"]) {
+  document.addEventListener(type, (event) => {
+    const zone = event.target.closest?.("#dropzone");
+    if (!zone) return;
+    event.preventDefault();
+    zone.classList.add("over");
+  });
+}
+
+document.addEventListener("dragleave", (event) => event.target.closest?.("#dropzone")?.classList.remove("over"));
+
+document.addEventListener("drop", (event) => {
+  if (!event.target.closest?.("#dropzone")) return;
+  event.preventDefault();
+  addPhotos(event.dataTransfer.files);
+});
+
+render();
+queueProductLookups();

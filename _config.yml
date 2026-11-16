@@ -1,0 +1,7 @@
+title: Bill Splitter
+description: Split grocery receipts between roommates and see who owes whom.
+lang: en
+
+exclude:
+  - README.md
+  - LICENSE
