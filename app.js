@@ -385,9 +385,11 @@ function barcodeCandidates(code) {
   if (isValidBarcode(code)) {
     add(code);
     if (code.length < 13) add(code.padStart(13, "0"));
+  } else if (code.length === 11) {
+    add(code + checkDigit(code));
   } else {
-    if (code.length <= 12) add(code + checkDigit(code));
-    add(code);
+    const body = code.slice(0, -1);
+    add(body + checkDigit(body));
   }
   return out.slice(0, 3);
 }
